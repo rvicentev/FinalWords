@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FINAL SENTENCE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ══════════════════════════════════════
+       PANTALLA: INICIO
+  ══════════════════════════════════════ -->
+  <div id="screen-home" class="screen active">
+    <div class="scanlines"></div>
+    <div class="noise"></div>
+
+    <header class="home-header">
+      <div class="title-glitch" data-text="FINAL">FINAL</div>
+      <div class="title-glitch sub" data-text="SENTENCE">SENTENCE</div>
+      <p class="tagline">¿Quién escribe más rápido? Demuéstralo.</p>
+    </header>
+
+    <div class="home-card">
+      <div class="input-group">
+        <label for="input-name">TU NOMBRE</label>
+        <input id="input-name" type="text" maxlength="20"
+               placeholder="Ej: SpeedTyper99" autocomplete="off" spellcheck="false" />
+      </div>
+
+      <div class="home-actions">
+        <button id="btn-create" class="btn btn-primary">
+          <span class="btn-icon">⊕</span> CREAR SALA
+        </button>
+        <div class="divider"><span>o</span></div>
+        <div class="join-group">
+          <input id="input-code" type="text" maxlength="5"
+                 placeholder="CÓDIGO" autocomplete="off" spellcheck="false" />
+          <button id="btn-join" class="btn btn-secondary">
+            <span class="btn-icon">→</span> UNIRSE
+          </button>
+        </div>
+      </div>
+
+      <div id="home-error" class="error-banner hidden"></div>
+    </div>
+
+    <footer class="home-footer">
+      <span>SPEED TYPING BATTLE · ONLINE MULTIPLAYER</span>
+    </footer>
+  </div>
+
+  <!-- ══════════════════════════════════════
+       PANTALLA: SALA DE ESPERA
+  ══════════════════════════════════════ -->
+  <div id="screen-lobby" class="screen">
+    <div class="scanlines"></div>
+
+    <div class="lobby-layout">
+      <!-- Columna izquierda: info de sala -->
+      <div class="lobby-main">
+        <div class="lobby-header">
+          <button id="btn-leave" class="btn-icon-only" title="Salir">✕</button>
+          <div class="room-info">
+            <span class="room-label">CÓDIGO DE SALA</span>
+            <div class="room-code-display">
+              <span id="lobby-room-code">XXXXX</span>
+              <button id="btn-copy-code" class="btn-copy" title="Copiar">⧉</button>
+            </div>
+          </div>
+        </div>
+
+        <h2 class="lobby-title">SALA DE ESPERA</h2>
+
+        <div class="players-section">
+          <div class="section-label">JUGADORES <span id="player-count">0</span>/8</div>
+          <div id="lobby-players" class="player-list"></div>
+        </div>
+
+        <div id="lobby-host-controls" class="host-controls hidden">
+          <p class="hint-text">Eres el anfitrión. Puedes iniciar cuando estés listo.</p>
+          <button id="btn-start" class="btn btn-primary btn-large">
+            ▶ INICIAR PARTIDA
+          </button>
+        </div>
+        <div id="lobby-waiting-msg" class="waiting-msg hidden">
+          <div class="pulse-dot"></div>
+          Esperando a que el anfitrión inicie la partida...
+        </div>
+
+        <div id="lobby-error" class="error-banner hidden"></div>
+      </div>
+
+      <!-- Columna derecha: chat -->
+      <div class="lobby-chat">
+        <div class="section-label">CHAT DE SALA</div>
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-input-row">
+          <input id="chat-input" type="text" maxlength="200"
+                 placeholder="Escribe un mensaje..." autocomplete="off" />
+          <button id="btn-chat-send" class="btn btn-secondary">↵</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════
+       PANTALLA: JUEGO
+  ══════════════════════════════════════ -->
+  <div id="screen-game" class="screen">
+    <div class="scanlines"></div>
+
+    <!-- HUD superior -->
+    <div class="game-hud">
+      <div class="hud-left">
+        <div class="hud-label">SALA</div>
+        <div id="hud-room-code" class="hud-value">XXXXX</div>
+      </div>
+      <div class="hud-center">
+        <div class="hud-label">FRASE</div>
+        <div id="hud-phrase-counter" class="hud-value">1/5</div>
+      </div>
+      <div class="hud-right">
+        <div class="hud-label">VIDAS</div>
+        <div id="hud-lives" class="hud-lives">❤❤❤</div>
+      </div>
+    </div>
+
+    <!-- Barra de progreso tipo carrera -->
+    <div class="race-track">
+      <div id="race-players" class="race-players"></div>
+    </div>
+
+    <!-- Área de escritura principal -->
+    <div class="game-arena">
+
+      <!-- Overlay: Eliminado -->
+      <div id="eliminated-overlay" class="overlay-state hidden">
+        <div class="overlay-icon">💀</div>
+        <div class="overlay-title">ELIMINADO</div>
+        <div class="overlay-sub">Sin vidas restantes</div>
+        <p class="overlay-hint">Observa cómo los demás terminan la partida...</p>
+      </div>
+
+      <!-- Overlay: Esperando siguiente frase -->
+      <div id="waiting-overlay" class="overlay-state hidden">
+        <div class="overlay-icon">✓</div>
+        <div class="overlay-title">¡CORRECTO!</div>
+        <div class="overlay-sub">Siguiente frase en...</div>
+        <div id="countdown-num" class="countdown-display">5</div>
+      </div>
+
+      <!-- Área principal de tipeo -->
+      <div id="typing-area" class="typing-area">
+        <!-- Frase objetivo renderizada char a char -->
+        <div class="phrase-display-wrapper">
+          <div id="phrase-display" class="phrase-display"></div>
+        </div>
+
+        <!-- Campo de entrada oculto (captura las teclas) -->
+        <input id="typing-input" class="typing-input" type="text"
+               autocomplete="off" autocorrect="off" autocapitalize="none"
+               spellcheck="false" />
+
+        <!-- Instrucción -->
+        <div id="typing-hint" class="typing-hint">Haz clic aquí o empieza a escribir</div>
+
+        <!-- Barra de error animada -->
+        <div id="error-bar" class="error-bar hidden"></div>
+      </div>
+    </div>
+
+    <!-- Ranking en vivo -->
+    <div class="live-ranking">
+      <div class="section-label">RANKING EN VIVO</div>
+      <div id="live-players" class="live-player-list"></div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════
+       PANTALLA: GAME OVER
+  ══════════════════════════════════════ -->
+  <div id="screen-gameover" class="screen">
+    <div class="scanlines"></div>
+    <div class="particles" id="particles"></div>
+
+    <div class="gameover-content">
+      <div class="gameover-trophy">🏆</div>
+      <div class="gameover-label">GANADOR</div>
+      <div id="gameover-winner" class="gameover-winner">—</div>
+
+      <div class="final-standings">
+        <div class="section-label">CLASIFICACIÓN FINAL</div>
+        <div id="final-player-list" class="final-player-list"></div>
+      </div>
+
+      <div id="gameover-host-controls" class="gameover-actions hidden">
+        <button id="btn-rematch" class="btn btn-primary">
+          ↺ REVANCHA
+        </button>
+        <button id="btn-exit" class="btn btn-ghost">
+          ⊘ SALIR AL INICIO
+        </button>
+      </div>
+      <div id="gameover-guest-controls" class="gameover-actions hidden">
+        <button id="btn-exit-guest" class="btn btn-ghost">
+          ⊘ SALIR AL INICIO
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Socket.io desde CDN -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

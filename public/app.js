@@ -1,185 +1,191 @@
 // =============================================================
 //  app.js — Final Sentence · Cliente
-//  Maneja la UI, Socket.io, y la lógica de tipeo del lado cliente
 // =============================================================
-
 'use strict';
 
-// ── Conexión al servidor ──────────────────────────────────────
+// ── Seguridad: deshabilitar console en producción parcialmente ─
+// (el servidor valida todo; esto dificulta el abuso desde consola)
+(function() {
+  const _warn = console.warn.bind(console);
+  let _token = null;
+
+  // El token se asigna desde el servidor y se guarda aquí
+  window.__setToken = (t) => { _token = t; };
+
+  // Monkey-patch del socket para requerir token en eventos críticos
+  window.__getToken = () => _token;
+
+  // Bloquear escritura directa de socket desde la consola
+  Object.defineProperty(window, '_socketDirect', {
+    get() { _warn('[FS] No access'); return null; },
+    set() { _warn('[FS] No access'); },
+  });
+})();
+
+// ── Conexión ──────────────────────────────────────────────────
 const socket = io();
 
-// ── Estado global del cliente ─────────────────────────────────
+// ── Estado ────────────────────────────────────────────────────
 const state = {
-  playerId:     null,
-  playerName:   '',
-  roomCode:     '',
-  hostId:       null,
-  isHost:       false,
-  players:      [],
+  playerId:       null,
+  playerName:     '',
+  roomCode:       '',
+  hostId:         null,
+  isHost:         false,
+  players:        [],
+  difficulty:     'normal',
+  diffConfig:     null,
 
   // Juego
-  currentPhrase:  '',
-  phraseIndex:    0,
-  totalPhrases:   5,
-  lives:          3,
-  maxLives:       3,
-  typedText:      '',
-  isWaiting:      false,   // esperando siguiente frase
+  currentPhrase:       '',
+  nextPhraseText:      null,
+  phraseIndexInBlock:  0,
+  blockIndex:          0,
+  totalBlocks:         3,
+  phrasesPerBlock:     6,
+  lives:               3,
+  maxLives:            3,
+  typedText:           '',
+
+  // Flags de estado de juego
+  composing:      false,
+  penaltyActive:  false,
+  rouletteActive: false,
   isEliminated:   false,
   isFinished:     false,
-  countdownTimer:   null,
-  focused:          false,
-  composing:        false,   // dead key / IME en curso (tildes, etc.)
-  penaltyActive:    false,   // penalización por error activa
-  penaltyCountdown: null,
+  inBlockRest:    false,
+
+  // Timers
+  penaltyTimer:   null,
+  blockRestTimer: null,
+
+  // Resultado de ruleta pendiente
+  pendingRoulette: null,
 };
 
-// ── Sonidos (Web Audio API) ───────────────────────────────────
-const AudioCtx = window.AudioContext || window.webkitAudioContext;
-let audioCtx = null;
-
-function getAudio() {
-  if (!audioCtx) audioCtx = new AudioCtx();
-  return audioCtx;
-}
-
-function playTone(freq, duration, type = 'sine', gainVal = 0.15) {
+// ── Web Audio ─────────────────────────────────────────────────
+let _ac = null;
+function ac() { if (!_ac) _ac = new (window.AudioContext || window.webkitAudioContext)(); return _ac; }
+function tone(freq, dur, type='sine', vol=0.12) {
   try {
-    const ctx  = getAudio();
-    const osc  = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.type      = type;
-    osc.frequency.setValueAtTime(freq, ctx.currentTime);
-    gain.gain.setValueAtTime(gainVal, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + duration);
-  } catch (_) { /* silenciar errores de audio */ }
+    const o = ac().createOscillator(), g = ac().createGain();
+    o.connect(g); g.connect(ac().destination);
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, ac().currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac().currentTime + dur);
+    o.start(); o.stop(ac().currentTime + dur);
+  } catch(_) {}
 }
+const snd = {
+  key:     () => tone(900, 0.04, 'sine', 0.07),
+  error:   () => { tone(220, 0.1, 'sawtooth', 0.18); setTimeout(() => tone(160, 0.12, 'sawtooth', 0.18), 70); },
+  done:    () => [523,659,784,1047].forEach((f,i) => setTimeout(() => tone(f,0.14,'sine',0.13), i*70)),
+  block:   () => [440,554,659,880,1047].forEach((f,i) => setTimeout(() => tone(f,0.18,'sine',0.15), i*80)),
+  elim:    () => [300,250,200,150].forEach((f,i) => setTimeout(() => tone(f,0.2,'sawtooth',0.2), i*90)),
+  roul:    () => { let t=0; for(let i=0;i<8;i++) { setTimeout(()=>tone(600-i*30,0.05,'square',0.08),t); t+=60+i*25; } },
+  bullet:  () => { tone(80,0.3,'sawtooth',0.3); setTimeout(()=>tone(50,0.4,'sawtooth',0.2),100); },
+  saved:   () => [880,1100,1320].forEach((f,i) => setTimeout(()=>tone(f,0.15,'sine',0.15),i*80)),
+};
 
-function soundCorrectChar() { playTone(880, 0.05, 'sine', 0.08); }
-function soundError() {
-  playTone(200, 0.12, 'sawtooth', 0.2);
-  setTimeout(() => playTone(150, 0.12, 'sawtooth', 0.2), 80);
-}
-function soundPhraseComplete() {
-  [523, 659, 784, 1047].forEach((f, i) =>
-    setTimeout(() => playTone(f, 0.15, 'sine', 0.15), i * 80)
-  );
-}
-function soundEliminated() {
-  [300, 250, 200, 150].forEach((f, i) =>
-    setTimeout(() => playTone(f, 0.2, 'sawtooth', 0.2), i * 100)
-  );
-}
-
-// ── Utilidades DOM ────────────────────────────────────────────
+// ── DOM helpers ───────────────────────────────────────────────
 const $ = id => document.getElementById(id);
+const html = str => { const d = document.createElement('div'); d.innerHTML = str; return d.firstChild; };
 
 function showScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   $(`screen-${name}`).classList.add('active');
 }
-
-function showError(elementId, msg) {
-  const el = $(elementId);
-  el.textContent = msg;
-  el.classList.remove('hidden');
+function showError(id, msg) {
+  const el = $(id); el.textContent = msg; el.classList.remove('hidden');
   setTimeout(() => el.classList.add('hidden'), 5000);
 }
-
-function copyToClipboard(text) {
-  navigator.clipboard?.writeText(text).catch(() => {});
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function emoji(name) {
+  const e=['🎮','🕹️','⚡','🔥','💀','🌀','🎯','⭐','🚀','💎'];
+  let c=0; for(const ch of name) c+=ch.charCodeAt(0); return e[c%e.length];
 }
 
-// ── Pantalla: HOME ────────────────────────────────────────────
-const inputName  = $('input-name');
-const inputCode  = $('input-code');
-const btnCreate  = $('btn-create');
-const btnJoin    = $('btn-join');
-
-btnCreate.addEventListener('click', () => {
-  const name = inputName.value.trim();
-  if (!name) return showError('home-error', 'Introduce tu nombre antes de crear la sala.');
-  socket.emit('create-room', { playerName: name });
+// ── Seguridad: token de sesión ────────────────────────────────
+socket.on('session-token', ({ token }) => {
+  window.__setToken(token);
 });
 
-btnJoin.addEventListener('click', () => {
+// ════════════════════════════════════════════════════
+//  HOME
+// ════════════════════════════════════════════════════
+const inputName = $('input-name');
+const inputCode = $('input-code');
+
+$('btn-create').addEventListener('click', () => {
+  const name = inputName.value.trim();
+  const diff = state.difficulty || 'normal';
+  if (!name) return showError('home-error', 'Introduce tu nombre.');
+  socket.emit('create-room', { playerName: name, difficulty: diff });
+});
+$('btn-join').addEventListener('click', () => {
   const name = inputName.value.trim();
   const code = inputCode.value.trim().toUpperCase();
   if (!name) return showError('home-error', 'Introduce tu nombre.');
-  if (!code || code.length !== 5) return showError('home-error', 'El código de sala debe tener 5 caracteres.');
+  if (code.length !== 5) return showError('home-error', 'El código debe tener 5 caracteres.');
   socket.emit('join-room', { roomCode: code, playerName: name });
 });
+inputName.addEventListener('keydown', e => { if (e.key==='Enter') { inputCode.value.trim().length===5 ? $('btn-join').click() : $('btn-create').click(); } });
+inputCode.addEventListener('keydown', e => { if (e.key==='Enter') $('btn-join').click(); });
+inputCode.addEventListener('input', () => { inputCode.value = inputCode.value.toUpperCase(); });
 
-inputName.addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    const code = inputCode.value.trim();
-    if (code.length === 5) btnJoin.click();
-    else btnCreate.click();
-  }
+// ════════════════════════════════════════════════════
+//  LOBBY
+// ════════════════════════════════════════════════════
+$('btn-leave').addEventListener('click', () => { socket.disconnect(); setTimeout(()=>location.reload(),100); });
+$('btn-copy-code').addEventListener('click', () => {
+  navigator.clipboard?.writeText(state.roomCode);
+  const b=$('btn-copy-code'); b.textContent='✓'; b.classList.add('copied');
+  setTimeout(()=>{ b.textContent='⧉'; b.classList.remove('copied'); }, 1600);
 });
-inputCode.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoin.click(); });
-inputCode.addEventListener('input', () => {
-  inputCode.value = inputCode.value.toUpperCase();
-});
+$('btn-start').addEventListener('click', () => socket.emit('start-game'));
 
-// ── Pantalla: LOBBY ───────────────────────────────────────────
-const btnLeave    = $('btn-leave');
-const btnCopyCode = $('btn-copy-code');
-const btnStart    = $('btn-start');
-const chatInput   = $('chat-input');
-const btnChatSend = $('btn-chat-send');
-
-btnLeave.addEventListener('click', () => {
-  socket.disconnect();
-  setTimeout(() => { socket.connect(); location.reload(); }, 100);
-});
-
-btnCopyCode.addEventListener('click', () => {
-  copyToClipboard(state.roomCode);
-  btnCopyCode.textContent = '✓';
-  btnCopyCode.classList.add('copied');
-  setTimeout(() => {
-    btnCopyCode.textContent = '⧉';
-    btnCopyCode.classList.remove('copied');
-  }, 1500);
+// Difficulty buttons
+document.querySelectorAll('.diff-opt').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.diff-opt').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    // host changes difficulty by leaving and re-creating... or we just track locally for create
+    state.difficulty = btn.dataset.diff;
+    updateDiffDesc(state.difficulty);
+  });
 });
 
-btnStart.addEventListener('click', () => {
-  socket.emit('start-game');
-});
+function updateDiffDesc(diff) {
+  const descs = {
+    easy:   'Sin tildes · Frases cortas · 3 vidas por bloque · Ruleta suave',
+    normal: 'Con tildes · Frases medianas · 3 vidas por bloque',
+    hard:   'Tildes + diéresis · Frases largas · 2 vidas · Ruleta agresiva',
+    hell:   'Todo · Frases muy largas · 2 vidas · Ruleta extrema',
+  };
+  $('diff-desc').textContent = descs[diff] || '';
+}
+updateDiffDesc('normal');
 
-function sendChatMessage() {
-  const msg = chatInput.value.trim();
+// Chat
+function sendChat() {
+  const msg = $('chat-input').value.trim();
   if (!msg) return;
   socket.emit('chat-message', { message: msg });
-  chatInput.value = '';
+  $('chat-input').value = '';
 }
-btnChatSend.addEventListener('click', sendChatMessage);
-chatInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendChatMessage(); });
+$('btn-chat-send').addEventListener('click', sendChat);
+$('chat-input').addEventListener('keydown', e => { if(e.key==='Enter') sendChat(); });
 
-function addChatMessage(playerName, message, isSystem = false) {
-  const messages = $('chat-messages');
+function addChat(playerName, message, sys=false) {
+  const log = $('chat-messages');
   const div = document.createElement('div');
-  div.className = `chat-msg ${isSystem ? 'system-msg' : ''}`;
-  if (!isSystem) {
-    div.innerHTML = `<span class="msg-name">${escapeHtml(playerName)}</span><span class="msg-text">${escapeHtml(message)}</span>`;
-  } else {
-    div.innerHTML = `<span class="msg-text">${escapeHtml(message)}</span>`;
-  }
-  messages.appendChild(div);
-  messages.scrollTop = messages.scrollHeight;
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  div.className = `chat-entry${sys?' sys':''}`;
+  if (sys) div.innerHTML = `<span class="cm">${escHtml(message)}</span>`;
+  else div.innerHTML = `<span class="cn">${escHtml(playerName)}</span><span class="cm">${escHtml(message)}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
 }
 
 function renderLobbyPlayers(players) {
@@ -187,255 +193,325 @@ function renderLobbyPlayers(players) {
   list.innerHTML = '';
   players.forEach(p => {
     const div = document.createElement('div');
-    div.className = `player-entry ${p.id === state.playerId ? 'is-you' : ''}`;
+    div.className = `player-entry${p.id===state.playerId?' is-you':''}`;
     const badges = [];
-    if (p.isHost) badges.push('<span class="player-badge badge-host">ANFITRIÓN</span>');
-    if (p.id === state.playerId) badges.push('<span class="player-badge badge-you">TÚ</span>');
+    if (p.isHost) badges.push(`<span class="badge badge-host">ANFITRIÓN</span>`);
+    if (p.id===state.playerId) badges.push(`<span class="badge badge-you">TÚ</span>`);
     div.innerHTML = `
-      <div class="player-avatar">${getPlayerEmoji(p.name)}</div>
-      <div class="player-name">${escapeHtml(p.name)}</div>
-      ${badges.join('')}
-    `;
+      <div class="player-avatar">${emoji(p.name)}</div>
+      <div class="player-name">${escHtml(p.name)}</div>
+      ${badges.join('')}`;
     list.appendChild(div);
   });
   $('player-count').textContent = players.length;
 }
 
-function getPlayerEmoji(name) {
-  const emojis = ['🎮','🕹️','⚡','🔥','💀','🌀','🎯','⭐','🚀','💎'];
-  let code = 0;
-  for (const c of name) code += c.charCodeAt(0);
-  return emojis[code % emojis.length];
-}
-
 function updateLobbyHostUI() {
+  const hc = $('lobby-host-controls');
+  const wm = $('lobby-waiting-msg');
+  const ds = $('diff-selector');
   if (state.isHost) {
-    $('lobby-host-controls').classList.remove('hidden');
-    $('lobby-waiting-msg').classList.add('hidden');
+    hc.classList.remove('hidden'); wm.classList.add('hidden');
+    ds.classList.remove('hidden');
   } else {
-    $('lobby-host-controls').classList.add('hidden');
-    $('lobby-waiting-msg').classList.remove('hidden');
+    hc.classList.add('hidden'); wm.classList.remove('hidden');
+    ds.classList.add('hidden');
   }
 }
 
-// ── Pantalla: JUEGO ───────────────────────────────────────────
-const typingInput = $('typing-input');
+function setDiffBadge(diff, config) {
+  const badge = $('lobby-diff-badge');
+  badge.textContent = `${config?.emoji||''} ${config?.label||diff}`;
+  badge.className = `diff-badge ${diff}`;
+}
+
+// ════════════════════════════════════════════════════
+//  JUEGO — Área de escritura
+// ════════════════════════════════════════════════════
+const typingInput   = $('typing-input');
 const phraseDisplay = $('phrase-display');
-const typingHint  = $('typing-hint');
-const hudLives    = $('hud-lives');
+const typingHint    = $('typing-hint');
 
-// Hacer focus en el input al hacer clic en el área
-document.querySelector('.typing-area').addEventListener('click', () => {
-  if (!state.isWaiting && !state.isEliminated && !state.isFinished) {
-    typingInput.focus();
-    state.focused = true;
-    typingHint.classList.add('active');
-  }
-});
-
-// También focus con cualquier tecla en la pantalla de juego
-document.addEventListener('keydown', (e) => {
-  if ($('screen-game').classList.contains('active') &&
-      !state.isWaiting && !state.isEliminated && !state.isFinished &&
-      !e.ctrlKey && !e.altKey && !e.metaKey) {
-    typingInput.focus();
-    state.focused = true;
-    typingHint.classList.add('active');
-  }
-});
-
-// ── Lógica de escritura ───────────────────────────────────────
-
-// Eventos de composición: gestionan dead keys y tildes en teclados españoles.
-// Cuando el usuario pulsa ´ y luego 'a', el navegador emite:
-//   compositionstart → compositionupdate (´) → compositionend → input (á)
-// Sin esto, el ´ solitario dispararía un error falso.
-typingInput.addEventListener('compositionstart', () => {
-  state.composing = true;
-});
-typingInput.addEventListener('compositionend', () => {
-  state.composing = false;
-  // Validar ahora que la composición terminó (la vocal acentuada ya está en el input)
-  validateTyping();
-});
-
-typingInput.addEventListener('input', () => {
-  if (state.composing) return; // esperar a que termine la composición
-  validateTyping();
-});
-
-function validateTyping() {
-  if (state.isWaiting || state.isEliminated || state.isFinished || state.penaltyActive) {
-    typingInput.value = state.typedText; // restaurar sin el carácter nuevo
-    return;
-  }
-
-  const typed  = typingInput.value;
-  const phrase = state.currentPhrase;
-
-  // Validación carácter a carácter
-  for (let i = 0; i < typed.length; i++) {
-    if (typed[i] !== phrase[i]) {
-      triggerError();
-      return;
-    }
-  }
-
-  state.typedText = typed;
-  renderPhrase(typed);
-  soundCorrectChar();
-
-  // ¿Completó la frase?
-  if (typed === phrase) {
-    handlePhraseComplete();
-  }
+function canType() {
+  return !state.penaltyActive && !state.rouletteActive
+      && !state.isEliminated && !state.isFinished && !state.inBlockRest;
 }
 
-// Evitar pegar texto
-typingInput.addEventListener('paste', e => e.preventDefault());
+// Click / keydown → focus
+$('game-arena').addEventListener('click', () => { if (canType()) { typingInput.focus(); typingHint.classList.add('gone'); } });
+document.addEventListener('keydown', e => {
+  if (!$('screen-game').classList.contains('active')) return;
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (canType()) { typingInput.focus(); typingHint.classList.add('gone'); }
+});
 
-// No se permite borrar: el backspace reinicia
-typingInput.addEventListener('keydown', (e) => {
+// Composition (dead keys, tildes)
+typingInput.addEventListener('compositionstart', () => { state.composing = true; });
+typingInput.addEventListener('compositionend',   () => { state.composing = false; validate(); });
+typingInput.addEventListener('input', () => { if (!state.composing) validate(); });
+typingInput.addEventListener('paste', e => e.preventDefault());
+typingInput.addEventListener('keydown', e => {
   if (e.key === 'Backspace') {
     e.preventDefault();
-    if (!state.penaltyActive && typingInput.value.length > 0) {
-      triggerError();
-    }
+    if (canType() && typingInput.value.length > 0) triggerError();
   }
 });
 
-function triggerError() {
-  if (state.penaltyActive) return; // ya hay penalización en curso
+function validate() {
+  if (!canType()) { typingInput.value = state.typedText; return; }
+  const typed  = typingInput.value;
+  const phrase = state.currentPhrase;
+  for (let i=0; i<typed.length; i++) {
+    if (typed[i] !== phrase[i]) { triggerError(); return; }
+  }
+  state.typedText = typed;
+  renderPhrase(typed);
+  snd.key();
+  if (typed === phrase) phraseComplete();
+}
 
-  soundError();
+// ── Render de frase con palabras como unidades atómicas ───────
+function renderPhrase(typed) {
+  const phrase = state.currentPhrase;
+  phraseDisplay.innerHTML = '';
+  let charIdx = 0;
+
+  // Dividir en tokens: palabras y espacios
+  const tokens = phrase.split(/(\s+)/);
+
+  tokens.forEach(token => {
+    if (!token) return;
+    const isSpace = /^\s+$/.test(token);
+
+    if (isSpace) {
+      // Renderizar cada espacio como char independiente (no en .word para permitir salto)
+      for (const ch of token) {
+        const span = document.createElement('span');
+        span.className = 'char ' + charState(charIdx, typed);
+        span.textContent = '\u00A0';
+        phraseDisplay.appendChild(span);
+        charIdx++;
+      }
+    } else {
+      // Palabra: envolver en .word para que no se parta
+      const wordSpan = document.createElement('span');
+      wordSpan.className = 'word';
+      for (const ch of token) {
+        const span = document.createElement('span');
+        span.className = 'char ' + charState(charIdx, typed);
+        span.textContent = ch;
+        wordSpan.appendChild(span);
+        charIdx++;
+      }
+      phraseDisplay.appendChild(wordSpan);
+    }
+  });
+}
+
+function charState(i, typed) {
+  if (i < typed.length) return typed[i] === state.currentPhrase[i] ? 'correct' : 'error';
+  if (i === typed.length) return 'current';
+  return 'pending';
+}
+
+// ── Inicio de frase ───────────────────────────────────────────
+function startPhrase(phrase, nextPhrase, idxInBlock, blockIdx) {
+  state.currentPhrase      = phrase;
+  state.nextPhraseText     = nextPhrase;
+  state.phraseIndexInBlock = idxInBlock;
+  state.blockIndex         = blockIdx;
+  state.typedText          = '';
+  state.penaltyActive      = false;
+  state.rouletteActive     = false;
+  state.inBlockRest        = false;
+  if (state.penaltyTimer) { clearInterval(state.penaltyTimer); state.penaltyTimer = null; }
+
+  typingInput.value = '';
+  $('penalty-bar').classList.add('hidden');
+  $('roulette-overlay').classList.add('hidden');
+  $('block-rest-overlay').classList.add('hidden');
+  $('eliminated-overlay').classList.add('hidden');
+
+  renderPhrase('');
+  updateHUDPhrase();
+  updateNextPreview();
+  setTimeout(() => { typingInput.focus(); typingHint.classList.add('gone'); }, 80);
+}
+
+function updateNextPreview() {
+  const prev = $('next-phrase-preview');
+  if (state.nextPhraseText) {
+    $('next-phrase-text').textContent = state.nextPhraseText;
+    prev.classList.remove('hidden');
+  } else {
+    prev.classList.add('hidden');
+  }
+}
+
+// ── Error / Ruleta ────────────────────────────────────────────
+function triggerError() {
+  if (!canType()) return;
+  snd.error();
+  state.rouletteActive = true;
   typingInput.value = '';
   state.typedText   = '';
   renderPhrase('');
 
-  // Efecto visual de sacudida
-  const arena = document.querySelector('.game-arena');
+  // Sacudida
+  const arena = $('game-arena');
   arena.classList.remove('shake');
   void arena.offsetWidth;
   arena.classList.add('shake');
 
-  // Barra roja
-  const errorBar = $('error-bar');
-  errorBar.classList.remove('hidden');
-  setTimeout(() => errorBar.classList.add('hidden'), 400);
-
-  // ── Penalización de 3 segundos ────────────────────────────
-  state.penaltyActive = true;
-  typingInput.blur();
-
-  const penaltyEl  = $('penalty-overlay');
-  const penaltyNum = $('penalty-num');
-  penaltyEl.classList.remove('hidden');
-  let remaining = 3;
-  penaltyNum.textContent = remaining;
-
-  if (state.penaltyCountdown) clearInterval(state.penaltyCountdown);
-  state.penaltyCountdown = setInterval(() => {
-    remaining--;
-    penaltyNum.textContent = remaining;
-    if (remaining <= 0) {
-      clearInterval(state.penaltyCountdown);
-      state.penaltyCountdown = null;
-      state.penaltyActive    = false;
-      penaltyEl.classList.add('hidden');
-      if (!state.isWaiting && !state.isEliminated && !state.isFinished) {
-        typingInput.focus();
-      }
-    }
-  }, 1000);
-  // ─────────────────────────────────────────────────────────
-
-  // Notificar al servidor
+  // Mostrar ruleta con animación, servidor responde con resultado
+  showRoulette(null); // sin resultado aún
   socket.emit('phrase-error');
 }
 
-function handlePhraseComplete() {
-  soundPhraseComplete();
-  state.isWaiting = true;
-  typingInput.value = '';
+function showRoulette(result) {
+  // Marcar la cámara con bala (si ya hay resultado)
+  const wheel = $('roulette-wheel');
+  const pctEl = $('roulette-pct');
+  const verdEl = $('roulette-result');
+  const centerEl = wheel.querySelector('.rw-center');
 
+  // Reset cámaras
+  wheel.querySelectorAll('.rw-chamber').forEach(c => {
+    c.classList.remove('bullet', 'safe');
+  });
+  verdEl.classList.add('hidden');
+  verdEl.textContent = '';
+  centerEl.textContent = '?';
+
+  $('roulette-overlay').classList.remove('hidden');
+
+  if (result === null) {
+    // Esperando resultado del servidor: girar rápido
+    wheel.className = 'roulette-wheel spinning';
+    snd.roul();
+    return;
+  }
+
+  // Resultado recibido
+  state.pendingRoulette = result;
+  pctEl.textContent = `Peligro: ${Math.round(result.deathChance * 100)}%`;
+
+  // Detener y desacelerar
+  wheel.className = 'roulette-wheel slowing';
+
+  // Esperar a que pare (~2s) y mostrar resultado
+  setTimeout(() => {
+    wheel.className = 'roulette-wheel'; // parado
+
+    // Elegir qué cámara mostrar
+    if (result.dies || result.lifeElim) {
+      // Bullet en posición aleatoria
+      const bulletIdx = Math.floor(Math.random() * 6);
+      wheel.querySelectorAll('.rw-chamber')[bulletIdx].classList.add('bullet');
+      centerEl.textContent = '💀';
+      verdEl.className = 'roulette-verdict dead';
+      verdEl.textContent = result.dies ? '☠ ELIMINADO' : '💔 SIN VIDAS';
+      verdEl.classList.remove('hidden');
+      snd.bullet();
+    } else {
+      // Cámaras vacías: marcarlas en verde
+      wheel.querySelectorAll('.rw-chamber').forEach(c => c.classList.add('safe'));
+      centerEl.textContent = '✓';
+      verdEl.className = 'roulette-verdict saved';
+      verdEl.textContent = '✓ SALVADO';
+      verdEl.classList.remove('hidden');
+      snd.saved();
+    }
+  }, 2200);
+
+  // Después del resultado: aplicar consecuencias
+  setTimeout(() => {
+    $('roulette-overlay').classList.add('hidden');
+    state.rouletteActive = false;
+
+    if (result.dies || result.lifeElim) {
+      // Eliminación gestionada por el servidor (evento player-eliminated)
+      state.isEliminated = true;
+      snd.elim();
+      $('eliminated-overlay').classList.remove('hidden');
+    } else {
+      // Sobrevivió: actualizar vidas y aplicar penalización
+      updateLives(result.lives, state.maxLives);
+      startPenalty();
+    }
+  }, 4000);
+}
+
+// ── Penalización de 5s ────────────────────────────────────────
+function startPenalty() {
+  state.penaltyActive = true;
+  typingInput.blur();
+  $('penalty-bar').classList.remove('hidden');
+  let rem = 5;
+  $('penalty-count').textContent = rem;
+  if (state.penaltyTimer) clearInterval(state.penaltyTimer);
+  state.penaltyTimer = setInterval(() => {
+    rem--;
+    $('penalty-count').textContent = rem;
+    if (rem <= 0) {
+      clearInterval(state.penaltyTimer);
+      state.penaltyTimer  = null;
+      state.penaltyActive = false;
+      $('penalty-bar').classList.add('hidden');
+      // Avisar servidor para reiniciar timer anti-trampa
+      socket.emit('penalty-done');
+      if (canType()) { typingInput.focus(); }
+    }
+  }, 1000);
+}
+
+// ── Completar frase ───────────────────────────────────────────
+function phraseComplete() {
+  snd.done();
+  state.typedText = '';
+  typingInput.value = '';
   socket.emit('phrase-complete', { typedText: state.currentPhrase });
 }
 
-function renderPhrase(typed) {
-  const phrase = state.currentPhrase;
-  phraseDisplay.innerHTML = '';
-
-  for (let i = 0; i < phrase.length; i++) {
-    const span = document.createElement('span');
-    span.className = 'char';
-
-    if (i < typed.length) {
-      span.classList.add(typed[i] === phrase[i] ? 'correct' : 'error');
-    } else if (i === typed.length) {
-      span.classList.add('current');
-    } else {
-      span.classList.add('pending');
-    }
-
-    // Espacio se renderiza como espacio visible
-    span.textContent = phrase[i] === ' ' ? '\u00A0' : phrase[i];
-    phraseDisplay.appendChild(span);
-  }
-}
-
-function startPhrase(phrase, index, total) {
-  state.currentPhrase = phrase;
-  state.phraseIndex   = index;
-  state.totalPhrases  = total;
-  state.typedText     = '';
-  state.isWaiting     = false;
-
-  // Limpiar penalización si quedara activa
-  if (state.penaltyCountdown) clearInterval(state.penaltyCountdown);
-  state.penaltyActive    = false;
-  state.penaltyCountdown = null;
-  $('penalty-overlay').classList.add('hidden');
-
-  typingInput.value   = '';
-  renderPhrase('');
-
-  $('hud-phrase-counter').textContent = `${index + 1}/${total}`;
-  $('waiting-overlay').classList.add('hidden');
-  $('eliminated-overlay').classList.add('hidden');
-
-  // Focus automático
-  setTimeout(() => {
-    typingInput.focus();
-    typingHint.classList.add('active');
-  }, 100);
-}
-
+// ── Actualizar vidas ──────────────────────────────────────────
 function updateLives(lives, maxLives) {
   state.lives    = lives;
   state.maxLives = maxLives;
-  const hearts = '❤'.repeat(lives) + '🖤'.repeat(maxLives - lives);
-  hudLives.textContent = hearts;
+  $('hud-lives').textContent = '❤'.repeat(lives) + '🖤'.repeat(Math.max(0, maxLives - lives));
+}
+
+// ── HUD Frase ─────────────────────────────────────────────────
+function updateHUDPhrase() {
+  const i   = state.phraseIndexInBlock;
+  const tot = state.phrasesPerBlock;
+  $('pp-fill').style.width = `${(i / tot) * 100}%`;
+  $('pp-label').textContent = `${i}/${tot}`;
+}
+
+// ── Bloques ───────────────────────────────────────────────────
+function updateBlockPips(blockIndex) {
+  const pips = document.querySelectorAll('.bp');
+  pips.forEach((p, i) => {
+    p.classList.remove('done', 'active');
+    if (i < blockIndex) p.classList.add('done');
+    else if (i === blockIndex) p.classList.add('active');
+  });
 }
 
 // ── Race track ────────────────────────────────────────────────
-function renderRaceTrack(players) {
+function renderRace(players) {
   const container = $('race-players');
   container.innerHTML = '';
-  const total = state.totalPhrases || 5;
-
+  const total = state.totalBlocks * state.phrasesPerBlock || 18;
   players.forEach(p => {
-    const pct = Math.round((p.completedPhrases / total) * 100);
-    const isYou = p.id === state.playerId;
+    const pct = Math.min(100, Math.round((p.totalCompleted / total) * 100));
+    const you = p.id === state.playerId;
     const div = document.createElement('div');
     div.className = 'race-player';
     div.innerHTML = `
-      <div class="race-name ${isYou ? 'is-you' : ''}">${escapeHtml(p.name.substring(0, 10))}</div>
-      <div class="race-bar-bg">
-        <div class="race-bar-fill ${isYou ? 'is-you' : ''} ${p.eliminated ? 'eliminated' : ''}"
-             style="width: ${pct}%"></div>
-      </div>
-      <div class="race-car">${p.eliminated ? '💀' : isYou ? '🏎' : '🚗'}</div>
-    `;
+      <div class="race-name${you?' you':''}">${escHtml(p.name.substring(0,10))}</div>
+      <div class="race-bg"><div class="race-fill${you?' you':''}${p.eliminated?' elim':''}" style="width:${pct}%"></div></div>
+      <div class="race-icon">${p.eliminated?'💀':you?'🏎':'🚗'}</div>`;
     container.appendChild(div);
   });
 }
@@ -444,280 +520,259 @@ function renderRaceTrack(players) {
 function renderLiveRanking(players) {
   const container = $('live-players');
   container.innerHTML = '';
-  const total = state.totalPhrases || 5;
-
+  const total = state.totalBlocks * state.phrasesPerBlock || 18;
   players.forEach((p, i) => {
-    const isYou = p.id === state.playerId;
-    const rankLabel = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`;
-    const chip = document.createElement('div');
-    chip.className = `live-player-chip ${i === 0 ? 'rank-1' : ''} ${isYou ? 'is-you' : ''} ${p.eliminated ? 'eliminated' : ''}`;
+    const you   = p.id === state.playerId;
+    const rank  = ['🥇','🥈','🥉'][i] || `#${i+1}`;
+    const chip  = document.createElement('div');
+    chip.className = `live-chip${i===0?' rank1':''}${you?' you':''}${p.eliminated?' elim':''}`;
     chip.innerHTML = `
-      <span class="chip-rank ${i === 0 ? 'gold' : ''}">${rankLabel}</span>
-      <span class="chip-name">${escapeHtml(p.name)}</span>
-      <span class="chip-lives">${'❤'.repeat(p.lives)}${'🖤'.repeat(p.maxLives - p.lives)}</span>
-      <span class="chip-phrase">${p.completedPhrases}/${total}</span>
-    `;
+      <span class="chip-rank${i===0?' gold':''}">${rank}</span>
+      <span class="chip-name">${escHtml(p.name)}</span>
+      <span class="chip-lives">${'❤'.repeat(p.lives)}${'🖤'.repeat(p.maxLives-p.lives)}</span>
+      <span class="chip-progress">${p.completedBlocks}/${state.totalBlocks}B</span>`;
     container.appendChild(chip);
   });
 }
 
-// ── Game Over ─────────────────────────────────────────────────
-function renderGameOver(winner, players) {
-  $('gameover-winner').textContent = winner.name;
+// ════════════════════════════════════════════════════
+//  EVENTOS SOCKET — SERVIDOR
+// ════════════════════════════════════════════════════
 
-  const list = $('final-player-list');
-  list.innerHTML = '';
-  const sorted = [...players].sort((a, b) => b.completedPhrases - a.completedPhrases);
-
-  sorted.forEach((p, i) => {
-    const rankClasses = ['rank-gold', 'rank-silver', 'rank-bronze'];
-    const rankSymbols = ['🥇', '🥈', '🥉'];
-    const rankClass   = rankClasses[i] || 'rank-other';
-    const rankSymbol  = rankSymbols[i] || `#${i+1}`;
-    const isYou = p.id === state.playerId;
-
-    const entry = document.createElement('div');
-    entry.className = 'final-player-entry';
-    entry.innerHTML = `
-      <div class="final-rank ${rankClass}">${rankSymbol}</div>
-      <div class="final-player-name ${isYou ? 'is-you' : ''}">${escapeHtml(p.name)}</div>
-      <div class="final-phrases">${p.completedPhrases}/${state.totalPhrases} frases</div>
-      ${p.eliminated ? '<div class="final-elim-badge">ELIMINADO</div>' : ''}
-    `;
-    list.appendChild(entry);
-  });
-
-  // Controles según rol
-  if (state.isHost) {
-    $('gameover-host-controls').classList.remove('hidden');
-    $('gameover-guest-controls').classList.add('hidden');
-  } else {
-    $('gameover-host-controls').classList.add('hidden');
-    $('gameover-guest-controls').classList.remove('hidden');
-  }
-
-  // Partículas de celebración
-  spawnParticles();
-
-  showScreen('gameover');
-}
-
-function spawnParticles() {
-  const container = $('particles');
-  container.innerHTML = '';
-  const colors = ['#ffd60a', '#00e5ff', '#39ff14', '#ff6b2b', '#bf5af2', '#ff2d55'];
-  for (let i = 0; i < 50; i++) {
-    const p = document.createElement('div');
-    p.className = 'particle';
-    p.style.cssText = `
-      left: ${Math.random() * 100}%;
-      bottom: 0;
-      background: ${colors[Math.floor(Math.random() * colors.length)]};
-      animation-duration: ${1.5 + Math.random() * 2}s;
-      animation-delay: ${Math.random() * 0.5}s;
-      width: ${3 + Math.random() * 5}px;
-      height: ${3 + Math.random() * 5}px;
-    `;
-    container.appendChild(p);
-  }
-}
-
-// Botones de Game Over
-$('btn-rematch').addEventListener('click', () => {
-  socket.emit('request-rematch');
-});
-$('btn-exit').addEventListener('click', exitToHome);
-$('btn-exit-guest').addEventListener('click', exitToHome);
-
-function exitToHome() {
-  socket.disconnect();
-  setTimeout(() => { location.reload(); }, 100);
-}
-
-// ── Countdown para siguiente frase ────────────────────────────
-function startCountdown(seconds) {
-  if (state.countdownTimer) clearInterval(state.countdownTimer);
-  let remaining = seconds;
-  $('countdown-num').textContent = remaining;
-  $('waiting-overlay').classList.remove('hidden');
-
-  state.countdownTimer = setInterval(() => {
-    remaining--;
-    $('countdown-num').textContent = remaining;
-    if (remaining <= 0) {
-      clearInterval(state.countdownTimer);
-      state.countdownTimer = null;
-    }
-  }, 1000);
-}
-
-// ── Eventos Socket.io ─────────────────────────────────────────
-
-// Error del servidor
 socket.on('error-msg', ({ message }) => {
-  const screenName = document.querySelector('.screen.active').id;
-  if (screenName === 'screen-home')  showError('home-error', message);
-  if (screenName === 'screen-lobby') showError('lobby-error', message);
+  const id = $('screen-game').classList.contains('active') ? null
+           : $('screen-lobby').classList.contains('active') ? 'lobby-error' : 'home-error';
+  if (id) showError(id, message);
 });
 
-// Sala creada
-socket.on('room-created', ({ roomCode, playerId, hostId, players }) => {
+// ── Room created / joined ─────────────────────────────────────
+function onRoomEntered({ roomCode, playerId, hostId, players, difficulty, difficultyConfig }) {
   state.playerId  = playerId;
   state.roomCode  = roomCode;
   state.hostId    = hostId;
-  state.isHost    = true;
+  state.isHost    = hostId === playerId;
   state.players   = players;
-  state.playerName = inputName.value.trim();
+  state.difficulty = difficulty;
+  state.diffConfig = difficultyConfig;
 
   $('lobby-room-code').textContent = roomCode;
   $('hud-room-code').textContent   = roomCode;
+  setDiffBadge(difficulty, difficultyConfig);
   renderLobbyPlayers(players);
   updateLobbyHostUI();
-  addChatMessage('', '¡Sala creada! Comparte el código con tus amigos.', true);
+  $('chat-messages').innerHTML = '';
+}
+
+socket.on('room-created', data => {
+  onRoomEntered(data);
+  addChat('', `Sala creada: ${data.roomCode}`, true);
   showScreen('lobby');
 });
-
-// Sala unida
-socket.on('room-joined', ({ roomCode, playerId, hostId, players }) => {
-  state.playerId  = playerId;
-  state.roomCode  = roomCode;
-  state.hostId    = hostId;
-  state.isHost    = false;
-  state.players   = players;
-  state.playerName = inputName.value.trim();
-
-  $('lobby-room-code').textContent = roomCode;
-  $('hud-room-code').textContent   = roomCode;
-  renderLobbyPlayers(players);
-  updateLobbyHostUI();
-  addChatMessage('', `Te has unido a la sala ${roomCode}.`, true);
+socket.on('room-joined', data => {
+  onRoomEntered(data);
+  addChat('', `Te uniste a la sala ${data.roomCode}`, true);
   showScreen('lobby');
 });
-
-// Otro jugador se unió
 socket.on('player-joined', ({ players, playerName }) => {
   state.players = players;
   renderLobbyPlayers(players);
-  addChatMessage('', `${playerName} se ha unido a la sala.`, true);
+  addChat('', `${playerName} se unió.`, true);
 });
-
-// Jugador salió en lobby
 socket.on('player-left', ({ playerId, players }) => {
   state.players = players;
-  const p = state.players.find(p => p.id === playerId);
   renderLobbyPlayers(players);
-  addChatMessage('', 'Un jugador ha abandonado la sala.', true);
+  addChat('', 'Un jugador abandonó la sala.', true);
 });
-
-// Nuevo anfitrión
 socket.on('new-host', ({ hostId }) => {
   state.hostId = hostId;
   state.isHost = hostId === state.playerId;
   updateLobbyHostUI();
-  if (state.isHost) addChatMessage('', 'Ahora eres el anfitrión.', true);
+  if (state.isHost) addChat('', 'Ahora eres el anfitrión.', true);
 });
+socket.on('chat-message', ({ playerName, message }) => addChat(playerName, message));
 
-// Mensaje de chat
-socket.on('chat-message', ({ playerName, message }) => {
-  addChatMessage(playerName, message);
-});
+// ── Game started ──────────────────────────────────────────────
+socket.on('game-started', ({ phrase, nextPhrase, phraseIndexInBlock, blockIndex,
+                              totalBlocks, phrasesPerBlock, lives, maxLives,
+                              players, difficulty, difficultyLabel, difficultyEmoji }) => {
+  state.players           = players;
+  state.totalBlocks       = totalBlocks;
+  state.phrasesPerBlock   = phrasesPerBlock;
+  state.isEliminated      = false;
+  state.isFinished        = false;
+  state.penaltyActive     = false;
+  state.rouletteActive    = false;
+  state.inBlockRest       = false;
+  state.difficultyLabel   = difficultyLabel;
 
-// Partida iniciada
-socket.on('game-started', ({ phrase, phraseIndex, totalPhrases, players }) => {
-  state.players      = players;
-  state.isEliminated = false;
-  state.isFinished   = false;
-  state.isWaiting    = false;
-
-  // Resetear HUD
-  updateLives(3, 3);
-  $('hud-room-code').textContent = state.roomCode;
-
-  renderRaceTrack(players);
+  updateLives(lives, maxLives);
+  updateBlockPips(blockIndex);
+  renderRace(players);
   renderLiveRanking(players);
   showScreen('game');
 
-  // Pequeño delay dramático antes de mostrar la frase
-  setTimeout(() => {
-    startPhrase(phrase, phraseIndex, totalPhrases);
-  }, 500);
+  setTimeout(() => startPhrase(phrase, nextPhrase, phraseIndexInBlock, blockIndex), 400);
 });
 
-// Actualización de vidas (tras error sin eliminación)
-socket.on('lives-updated', ({ lives, maxLives }) => {
-  updateLives(lives, maxLives);
+// ── Resultado de ruleta ───────────────────────────────────────
+socket.on('roulette-result', result => {
+  state.pendingRoulette = result;
+  $('roulette-pct').textContent = `Peligro: ${Math.round(result.deathChance * 100)}%`;
+  showRoulette(result);
 });
 
-// Jugador eliminado
+// ── Vidas actualizadas (ya gestionado dentro de roulette-result) ──
+socket.on('lives-updated', ({ lives, maxLives }) => updateLives(lives, maxLives));
+
+// ── Jugador eliminado (notificación a todos) ──────────────────
 socket.on('player-eliminated', ({ playerId, playerName, players }) => {
   state.players = players;
-  renderRaceTrack(players);
+  renderRace(players);
   renderLiveRanking(players);
-
   if (playerId === state.playerId) {
-    // Soy yo quien fue eliminado
     state.isEliminated = true;
-    soundEliminated();
-    updateLives(0, state.maxLives);
-    $('eliminated-overlay').classList.remove('hidden');
-    $('waiting-overlay').classList.add('hidden');
-    typingInput.blur();
+    // La UI de eliminación ya se muestra desde showRoulette()
   }
 });
 
-// Actualización de ranking
+// ── Ranking update ────────────────────────────────────────────
 socket.on('ranking-update', ({ players }) => {
   state.players = players;
-  renderRaceTrack(players);
+  renderRace(players);
   renderLiveRanking(players);
 });
 
-// Frase completada (confirmación del servidor)
-socket.on('phrase-complete-ack', ({ phraseIndex, totalPhrases, nextIn }) => {
-  startCountdown(nextIn);
+// ── Siguiente frase (mismo bloque) ───────────────────────────
+socket.on('next-phrase', ({ phrase, nextPhrase, phraseIndexInBlock, blockIndex }) => {
+  startPhrase(phrase, nextPhrase, phraseIndexInBlock, blockIndex);
+  updateHUDPhrase();
+  updateBlockPips(blockIndex);
 });
 
-// Siguiente frase (enviada tras la pausa de 5 s)
-socket.on('next-phrase', ({ phrase, phraseIndex, totalPhrases }) => {
-  if (state.isEliminated || state.isFinished) return;
-  startPhrase(phrase, phraseIndex, totalPhrases);
+// ── Frase rechazada (anti-trampa) ─────────────────────────────
+socket.on('phrase-rejected', ({ reason }) => {
+  console.warn('[FS] Frase rechazada:', reason);
+  // Si fue "too-fast", simplemente reiniciar sin penalización (edge case)
+  if (reason === 'too-fast') {
+    typingInput.value = '';
+    state.typedText   = '';
+    renderPhrase('');
+  }
 });
 
-// El servidor rechazó la frase (anti-trampa)
-socket.on('phrase-rejected', ({ message }) => {
-  console.warn('Frase rechazada por el servidor:', message);
-  triggerError();
+// ── Bloque completado ─────────────────────────────────────────
+socket.on('block-complete', ({ completedBlock, nextBlock, restSecs, newLives, maxLives }) => {
+  state.inBlockRest = true;
+  snd.block();
+  updateLives(newLives, maxLives);
+  updateBlockPips(nextBlock);
+
+  const restOv   = $('block-rest-overlay');
+  const titleEl  = $('block-rest-title');
+  const livesEl  = $('block-rest-lives');
+  const countEl  = $('block-rest-count');
+
+  titleEl.textContent = `BLOQUE ${completedBlock + 1} COMPLETADO`;
+  livesEl.textContent = `Vidas restauradas: ${'❤'.repeat(newLives)}`;
+  countEl.textContent = restSecs;
+  restOv.classList.remove('hidden');
+
+  let rem = restSecs - 1;
+  if (state.blockRestTimer) clearInterval(state.blockRestTimer);
+  state.blockRestTimer = setInterval(() => {
+    countEl.textContent = rem;
+    rem--;
+    if (rem < 0) {
+      clearInterval(state.blockRestTimer);
+      state.blockRestTimer = null;
+    }
+  }, 1000);
 });
 
-// Fin de partida
+// ── Inicio de nuevo bloque ────────────────────────────────────
+socket.on('block-start', ({ phrase, nextPhrase, phraseIndexInBlock, blockIndex, lives, maxLives }) => {
+  state.inBlockRest = false;
+  updateLives(lives, maxLives);
+  updateBlockPips(blockIndex);
+  startPhrase(phrase, nextPhrase, phraseIndexInBlock, blockIndex);
+});
+
+// ── Fin de partida ────────────────────────────────────────────
 socket.on('game-over', ({ winner, players }) => {
   state.isFinished = true;
-  if (state.countdownTimer) clearInterval(state.countdownTimer);
-  setTimeout(() => renderGameOver(winner, players), 800);
+  if (state.penaltyTimer)  { clearInterval(state.penaltyTimer); }
+  if (state.blockRestTimer){ clearInterval(state.blockRestTimer); }
+  setTimeout(() => renderGameOver(winner, players), 700);
 });
 
-// Revancha lista
-socket.on('rematch-ready', ({ players, hostId }) => {
-  state.hostId  = hostId;
-  state.isHost  = hostId === state.playerId;
-  state.players = players;
+// ═══════════════════════════════════════════
+//  GAME OVER
+// ═══════════════════════════════════════════
+function renderGameOver(winner, players) {
+  $('go-winner-name').textContent = winner.name;
+  const list = $('go-player-list');
+  list.innerHTML = '';
+  const sorted = [...players].sort((a,b) => b.totalCompleted - a.totalCompleted);
+  sorted.forEach((p, i) => {
+    const rankSyms  = ['🥇','🥈','🥉'];
+    const rankClass = ['rank-g','rank-s','rank-b'][i] || 'rank-o';
+    const sym       = rankSyms[i] || `#${i+1}`;
+    const you = p.id === state.playerId;
+    const div = document.createElement('div');
+    div.className = 'go-entry';
+    div.innerHTML = `
+      <div class="go-rank ${rankClass}">${sym}</div>
+      <div class="go-name${you?' you':''}">${escHtml(p.name)}</div>
+      <div class="go-stat">${p.completedBlocks}/${state.totalBlocks} bloq · ${p.totalCompleted} frases</div>
+      ${p.eliminated?'<div class="go-elim-badge">ELIM</div>':''}`;
+    list.appendChild(div);
+  });
 
+  if (state.isHost) {
+    $('go-host-btns').classList.remove('hidden');
+    $('go-guest-btns').classList.add('hidden');
+  } else {
+    $('go-host-btns').classList.add('hidden');
+    $('go-guest-btns').classList.remove('hidden');
+  }
+  spawnParticles();
+  showScreen('gameover');
+}
+
+function spawnParticles() {
+  const c = $('particles'); c.innerHTML = '';
+  const cols = ['#ffc400','#00f0ff','#00ff88','#ff7700','#c44fff','#ff2255'];
+  for (let i=0; i<55; i++) {
+    const p = document.createElement('div');
+    p.className = 'particle';
+    p.style.cssText = `left:${Math.random()*100}%;bottom:0;
+      background:${cols[i%cols.length]};
+      animation-duration:${1.5+Math.random()*2}s;
+      animation-delay:${Math.random()*0.6}s;
+      width:${3+Math.random()*5}px;height:${3+Math.random()*5}px;`;
+    c.appendChild(p);
+  }
+}
+
+$('btn-rematch').addEventListener('click', () => socket.emit('request-rematch'));
+$('btn-exit').addEventListener('click', () => { socket.disconnect(); setTimeout(()=>location.reload(),100); });
+$('btn-exit-guest').addEventListener('click', () => { socket.disconnect(); setTimeout(()=>location.reload(),100); });
+
+socket.on('rematch-ready', ({ players, hostId, difficulty, difficultyConfig }) => {
+  state.hostId    = hostId;
+  state.isHost    = hostId === state.playerId;
+  state.players   = players;
+  state.difficulty = difficulty;
+  state.diffConfig = difficultyConfig;
   $('lobby-room-code').textContent = state.roomCode;
+  setDiffBadge(difficulty, difficultyConfig);
   renderLobbyPlayers(players);
   updateLobbyHostUI();
   $('chat-messages').innerHTML = '';
-  addChatMessage('', '¡Revancha! El anfitrión puede iniciar cuando esté listo.', true);
+  addChat('', '¡Revancha lista! El anfitrión puede iniciar.', true);
   showScreen('lobby');
 });
 
-// Desconexión inesperada
-socket.on('disconnect', () => {
-  console.warn('Desconectado del servidor.');
-});
-
-// ── Inicialización ────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────
 showScreen('home');
 inputName.focus();
-
-console.log('%c FINAL SENTENCE ', 'background:#00e5ff;color:#06060d;font-family:monospace;font-size:18px;font-weight:bold;padding:6px 12px;border-radius:4px;');
-console.log('%c Speed Typing Battle · Online Multiplayer ', 'color:#6c7086;font-family:monospace;');

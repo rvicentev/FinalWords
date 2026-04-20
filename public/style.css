@@ -768,6 +768,37 @@ input[type="text"]::placeholder { color: var(--text-dim); }
   100% { opacity: 0; }
 }
 
+/* Penalty overlay */
+.penalty-overlay {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 45, 85, 0.12);
+  border: 1px solid var(--red-dim);
+  border-radius: var(--radius);
+  padding: 10px 20px;
+  animation: fade-in 0.15s ease;
+  width: 100%;
+  justify-content: center;
+}
+.penalty-icon { font-size: 1.1rem; }
+.penalty-text {
+  font-family: var(--font-title);
+  font-size: 0.75rem;
+  letter-spacing: 0.15em;
+  color: var(--red);
+}
+.penalty-num {
+  font-family: var(--font-title);
+  font-size: 1.8rem;
+  font-weight: 900;
+  color: var(--red);
+  text-shadow: 0 0 15px var(--red);
+  min-width: 2ch;
+  text-align: center;
+  animation: countdown-pulse 1s ease-in-out infinite;
+}
+
 /* Screen shake on error */
 @keyframes shake {
   0%, 100% { transform: translateX(0); }

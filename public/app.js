@@ -27,8 +27,11 @@ const state = {
   isWaiting:      false,   // esperando siguiente frase
   isEliminated:   false,
   isFinished:     false,
-  countdownTimer: null,
-  focused:        false,
+  countdownTimer:   null,
+  focused:          false,
+  composing:        false,   // dead key / IME en curso (tildes, etc.)
+  penaltyActive:    false,   // penalización por error activa
+  penaltyCountdown: null,
 };
 
 // ── Sonidos (Web Audio API) ───────────────────────────────────
@@ -242,19 +245,37 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ── Lógica de escritura ───────────────────────────────────────
-typingInput.addEventListener('input', (e) => {
-  if (state.isWaiting || state.isEliminated || state.isFinished) {
-    typingInput.value = '';
+
+// Eventos de composición: gestionan dead keys y tildes en teclados españoles.
+// Cuando el usuario pulsa ´ y luego 'a', el navegador emite:
+//   compositionstart → compositionupdate (´) → compositionend → input (á)
+// Sin esto, el ´ solitario dispararía un error falso.
+typingInput.addEventListener('compositionstart', () => {
+  state.composing = true;
+});
+typingInput.addEventListener('compositionend', () => {
+  state.composing = false;
+  // Validar ahora que la composición terminó (la vocal acentuada ya está en el input)
+  validateTyping();
+});
+
+typingInput.addEventListener('input', () => {
+  if (state.composing) return; // esperar a que termine la composición
+  validateTyping();
+});
+
+function validateTyping() {
+  if (state.isWaiting || state.isEliminated || state.isFinished || state.penaltyActive) {
+    typingInput.value = state.typedText; // restaurar sin el carácter nuevo
     return;
   }
 
-  const typed   = typingInput.value;
-  const phrase  = state.currentPhrase;
+  const typed  = typingInput.value;
+  const phrase = state.currentPhrase;
 
   // Validación carácter a carácter
   for (let i = 0; i < typed.length; i++) {
     if (typed[i] !== phrase[i]) {
-      // ERROR: reset inmediato
       triggerError();
       return;
     }
@@ -268,40 +289,65 @@ typingInput.addEventListener('input', (e) => {
   if (typed === phrase) {
     handlePhraseComplete();
   }
-});
+}
 
 // Evitar pegar texto
 typingInput.addEventListener('paste', e => e.preventDefault());
 
-// Evitar borrar más de lo que se tiene (backspace no borra chars correctos...)
-// En este juego no permitimos borrar: cualquier error reinicia
+// No se permite borrar: el backspace reinicia
 typingInput.addEventListener('keydown', (e) => {
   if (e.key === 'Backspace') {
-    e.preventDefault(); // No se puede borrar
-    // Si hay texto y el último char es incorrecto, tratarlo como error
-    // (el usuario no puede corregir, debe escribir perfecto)
-    if (typingInput.value.length > 0) {
+    e.preventDefault();
+    if (!state.penaltyActive && typingInput.value.length > 0) {
       triggerError();
     }
   }
 });
 
 function triggerError() {
+  if (state.penaltyActive) return; // ya hay penalización en curso
+
   soundError();
   typingInput.value = '';
   state.typedText   = '';
   renderPhrase('');
 
-  // Efecto visual de error
+  // Efecto visual de sacudida
   const arena = document.querySelector('.game-arena');
   arena.classList.remove('shake');
-  void arena.offsetWidth; // forzar reflow
+  void arena.offsetWidth;
   arena.classList.add('shake');
 
   // Barra roja
   const errorBar = $('error-bar');
   errorBar.classList.remove('hidden');
   setTimeout(() => errorBar.classList.add('hidden'), 400);
+
+  // ── Penalización de 3 segundos ────────────────────────────
+  state.penaltyActive = true;
+  typingInput.blur();
+
+  const penaltyEl  = $('penalty-overlay');
+  const penaltyNum = $('penalty-num');
+  penaltyEl.classList.remove('hidden');
+  let remaining = 3;
+  penaltyNum.textContent = remaining;
+
+  if (state.penaltyCountdown) clearInterval(state.penaltyCountdown);
+  state.penaltyCountdown = setInterval(() => {
+    remaining--;
+    penaltyNum.textContent = remaining;
+    if (remaining <= 0) {
+      clearInterval(state.penaltyCountdown);
+      state.penaltyCountdown = null;
+      state.penaltyActive    = false;
+      penaltyEl.classList.add('hidden');
+      if (!state.isWaiting && !state.isEliminated && !state.isFinished) {
+        typingInput.focus();
+      }
+    }
+  }, 1000);
+  // ─────────────────────────────────────────────────────────
 
   // Notificar al servidor
   socket.emit('phrase-error');
@@ -343,6 +389,12 @@ function startPhrase(phrase, index, total) {
   state.totalPhrases  = total;
   state.typedText     = '';
   state.isWaiting     = false;
+
+  // Limpiar penalización si quedara activa
+  if (state.penaltyCountdown) clearInterval(state.penaltyCountdown);
+  state.penaltyActive    = false;
+  state.penaltyCountdown = null;
+  $('penalty-overlay').classList.add('hidden');
 
   typingInput.value   = '';
   renderPhrase('');
